@@ -141,6 +141,52 @@ class TestCollector < Test::Unit::TestCase
     assert_include results.first[:source], 'PartialMethod'
   end
 
+  # D. smoke escape hatches: RUBY_RDOC_TARGETS / RUBY_RDOC_MAX_METHODS env vars
+  def with_env(vars)
+    saved = vars.keys.to_h { |k| [k, ENV[k]] }
+    vars.each { |k, v| ENV[k] = v }
+    yield
+  ensure
+    saved.each { |k, v| ENV[k] = v }
+  end
+
+  def test_targets_env_filters_to_listed_classes_only
+    entities = [build_entity('Keep1'), build_entity('Drop'), build_entity('Keep2')]
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    StubFetcher.new('/fake'),
+      parser:     StubParser.new(entities),
+      translator: @translator,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new)
+    results = with_env('RUBY_RDOC_TARGETS' => 'Keep1, Keep2') { c.collect }
+    sources = results.map { |r| r[:source] }
+    assert_equal 2, results.size
+    assert_include sources, 'ruby/ruby:rdoc/trunk/Keep1'
+    assert_include sources, 'ruby/ruby:rdoc/trunk/Keep2'
+    assert_not_include sources, 'ruby/ruby:rdoc/trunk/Drop'
+  end
+
+  def test_max_methods_env_caps_methods_per_class
+    methods = (1..10).map do |i|
+      RubyRdocCollector::MethodEntry.new(name: "m#{i}", call_seq: nil, description: "d#{i}")
+    end
+    entity = RubyRdocCollector::ClassEntity.new(
+      name: 'Big', description: 'desc', methods: methods, constants: [], superclass: 'Object'
+    )
+    counter = 0
+    mutex   = Mutex.new
+    counting = lambda { |_p| mutex.synchronize { counter += 1 }; 'JP' }
+    cache = RubyRdocCollector::TranslationCache.new(cache_dir: Dir.mktmpdir('csmoke'))
+    t = RubyRdocCollector::Translator.new(runner: counting, cache: cache, sleeper: ->(_s) {})
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    StubFetcher.new('/fake'),
+      parser:     StubParser.new([entity]),
+      translator: t,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new)
+    with_env('RUBY_RDOC_MAX_METHODS' => '3') { c.collect }
+    # 1 class desc + 3 methods (capped from 10) = 4 calls
+    assert_equal 4, counter
+  end
+
   def test_en_description_and_method_descriptions_wired_to_formatter
     # Verify that en_ fields appear in the output via <details> blocks
     methods = [

@@ -20,10 +20,28 @@ module RubyRdocCollector
     def collect(since: nil, before: nil)
       content_dir = @fetcher.fetch
       entities = @parser.parse(content_dir)
+      entities = apply_smoke_filters(entities)
       entities.filter_map { |e| safe_translate_and_format(e) }
     end
 
     private
+
+    # Smoke / integration-test escape hatches via env vars.
+    # Default behavior unchanged (no filter, no cap) when both vars are unset/empty.
+    #   RUBY_RDOC_TARGETS=Ruby::Box,Complex,Rational  → keep only those classes
+    #   RUBY_RDOC_MAX_METHODS=20                      → cap methods/class to first N
+    def apply_smoke_filters(entities)
+      targets_raw = ENV['RUBY_RDOC_TARGETS']
+      if targets_raw && !targets_raw.strip.empty?
+        target_set = targets_raw.split(',').map(&:strip)
+        entities = entities.select { |e| target_set.include?(e.name) }
+      end
+      max_methods = ENV['RUBY_RDOC_MAX_METHODS']&.to_i
+      if max_methods && max_methods > 0
+        entities = entities.map { |e| e.with(methods: e.methods.first(max_methods)) }
+      end
+      entities
+    end
 
     def safe_translate_and_format(entity)
       jp_desc    = @translator.translate(entity.description)
