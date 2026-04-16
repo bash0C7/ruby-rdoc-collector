@@ -65,7 +65,7 @@ module RubyRdocCollector
         fragment = m['path'].split('#', 2).last
         next unless fragment
 
-        method_div = doc.css("##{fragment}").first
+        method_div = doc.xpath(".//*[@id='#{fragment}']").first
 
         call_seq = nil
         description = m['snippet'] || ''

@@ -61,4 +61,16 @@ class TestHtmlParser < Test::Unit::TestCase
       assert_not_nil e.description
     end
   end
+
+  def test_handles_css_special_char_tilde_in_fragment
+    # Real rdoc search_data.js has fragments like "method-i-tilde~" where ~ is a
+    # CSS general sibling combinator — using css("#method-i-tilde~") crashes Oga.
+    # XPath attribute match must be used instead.
+    entities = @parser.parse(FIXTURE_DIR)
+    tc = entities.find { |e| e.name == 'TestClass' }
+    tilde_method = tc.methods.find { |m| m.name == 'tilde~' }
+    assert_not_nil tilde_method, "tilde~ method should be extracted despite CSS-special char in fragment"
+    assert_match(/tilde~/, tilde_method.call_seq)
+    assert_match(/tilde in its name/, tilde_method.description)
+  end
 end
