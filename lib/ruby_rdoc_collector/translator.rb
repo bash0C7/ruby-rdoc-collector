@@ -5,9 +5,9 @@ module RubyRdocCollector
   class Translator
     class TranslationError < StandardError; end
 
-    MODEL_TAG = 'claude-sonnet'
+    DEFAULT_MODEL       = 'haiku'
     DEFAULT_MAX_RETRIES = 3
-    RETRY_WAIT_SECONDS = 10
+    RETRY_WAIT_SECONDS  = 10
 
     PROMPT_HEADER = <<~HEADER
       あなたは Ruby の公式ドキュメント翻訳者です。
@@ -27,7 +27,10 @@ module RubyRdocCollector
       --- 入力ここから ---
     HEADER
 
-    def initialize(runner: nil, cache: TranslationCache.new, max_retries: DEFAULT_MAX_RETRIES, sleeper: ->(sec) { sleep(sec) })
+    attr_reader :model
+
+    def initialize(runner: nil, cache: TranslationCache.new, max_retries: DEFAULT_MAX_RETRIES, sleeper: ->(sec) { sleep(sec) }, model: DEFAULT_MODEL)
+      @model       = model
       @runner      = runner || default_runner
       @cache       = cache
       @max_retries = max_retries
@@ -49,7 +52,7 @@ module RubyRdocCollector
     private
 
     def cache_key(en_text)
-      Digest::SHA256.hexdigest("#{MODEL_TAG}::#{en_text}")
+      Digest::SHA256.hexdigest("#{@model}\n#{en_text}")
     end
 
     def run_with_retry(en_text)
@@ -72,7 +75,7 @@ module RubyRdocCollector
 
     def default_runner
       lambda do |prompt|
-        out, status = Open3.capture2e('claude', '--model', 'sonnet', '-p', '-', stdin_data: prompt)
+        out, status = Open3.capture2e('claude', '--model', @model, '-p', '-', stdin_data: prompt)
         raise TranslationError, "claude exit #{status.exitstatus}: #{out[0, 500]}" unless status.success?
         out
       end
