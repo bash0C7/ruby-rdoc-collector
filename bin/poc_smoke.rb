@@ -16,8 +16,38 @@
 #   THREADS         = 4        # thread pool size for parallel method translation
 #   MODEL           = 'haiku'  # Claude model (haiku = low cost, fast)
 #
-# == PoC Findings ==
-# (filled in after successful run — see commit docs)
+# == PoC Findings (2026-04-16, haiku model) ==
+#
+# Wall clock:
+#   1st run: 341.4s (3 class descs + 49 method descs = 52 Claude calls, 4 threads)
+#   2nd run: 0.0s   (translation cache hits 100% — perfect idempotency)
+#
+# Throughput: ~52 calls / 341s / 4 threads ≈ ~26s avg per thread per call.
+#   haiku is fast per-call but the parallel speedup is bounded by per-call latency,
+#   not by call count. 4 threads is well-tuned for this workload.
+#
+# Cost (haiku 4.5 pricing: $1/Mtok in, $5/Mtok out):
+#   ~500 in + ~300 out per call ≈ $0.0023/call → ~$0.12 for whole PoC, ~$0.04/class.
+#   Production estimate: 1014 classes × ~10 methods avg ≈ 10k calls → ~$23 first fill.
+#   With SHA cache, subsequent runs only translate changed entries → near-zero.
+#
+# Quality verdict: GOOD with one caveat.
+#   + Technical accuracy preserved (有理数, 分子, 分母, リテラル, etc.).
+#   + English originals correctly emitted in <details><summary>Original (en)</summary>
+#     blocks after each JP translation — human verification path works.
+#   ! CAVEAT: translation tone leaked dialect/persona from caller's global CLAUDE.md.
+#     Sample (Rational): "有理数は整数のペア a/b で表現される……のことやな。"
+#     Cause: `claude --model haiku -p -` inherits the user's Claude Code persona setup.
+#     Fix needed: Translator prompt must explicitly require neutral/standard Japanese
+#     and forbid persona/dialect adoption. Open as follow-up before Stage 3 production.
+#
+# Empty translations:
+#   Ruby::Box#require / #require_relative came back empty because the source RDoc
+#   has no <div class="method-description"> content (C-level method, undocumented).
+#   Not a translator bug. Formatter could optionally skip empty method blocks.
+#
+# Status: DONE_WITH_CONCERNS — proceed to followup (Translator prompt hardening)
+#         before Stage 3 integration.
 
 require 'bundler/setup'
 require 'timeout'
@@ -44,8 +74,8 @@ unless missing.empty?
   exit 1
 end
 
-# --- Phase 3: Cap methods per class ---
-selected.each { |e| e.methods = e.methods.first(MAX_METHODS) }
+# --- Phase 3: Cap methods per class (ClassEntity is Data, immutable — use #with) ---
+selected = selected.map { |e| e.with(methods: e.methods.first(MAX_METHODS)) }
 
 total_methods = selected.sum { |e| e.methods.size }
 puts "[poc_smoke] PoC plan: #{selected.size} classes, #{total_methods} methods, model=#{MODEL}, threads=#{THREADS}, cap=#{TIMEOUT_SECONDS}s"
