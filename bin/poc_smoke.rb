@@ -19,35 +19,40 @@
 # == PoC Findings (2026-04-16, haiku model) ==
 #
 # Wall clock:
-#   1st run: 341.4s (3 class descs + 49 method descs = 52 Claude calls, 4 threads)
-#   2nd run: 0.0s   (translation cache hits 100% — perfect idempotency)
+#   Run 1 (pre-fix):  341.4s (52 Claude calls, 4 threads, persona-contaminated)
+#   Run 2 (cache):    0.0s   (cache hit 100%)
+#   Run 3 (post-fix): 248.0s (re-translated all 52 after cache key v2 bump,
+#                             persona-clean — see Quality below)
 #
-# Throughput: ~52 calls / 341s / 4 threads ≈ ~26s avg per thread per call.
-#   haiku is fast per-call but the parallel speedup is bounded by per-call latency,
-#   not by call count. 4 threads is well-tuned for this workload.
+# Throughput: ~52 calls / ~250s / 4 threads ≈ ~19s avg per thread per call.
+#   haiku is fast per-call; parallel speedup bounded by per-call latency, not count.
+#   4 threads is well-tuned.
 #
 # Cost (haiku 4.5 pricing: $1/Mtok in, $5/Mtok out):
-#   ~500 in + ~300 out per call ≈ $0.0023/call → ~$0.12 for whole PoC, ~$0.04/class.
+#   ~500 in + ~300 out per call ≈ $0.0023/call → ~$0.12 for PoC, ~$0.04/class.
 #   Production estimate: 1014 classes × ~10 methods avg ≈ 10k calls → ~$23 first fill.
 #   With SHA cache, subsequent runs only translate changed entries → near-zero.
 #
-# Quality verdict: GOOD with one caveat.
+# Quality verdict: GOOD (after persona fix).
 #   + Technical accuracy preserved (有理数, 分子, 分母, リテラル, etc.).
+#   + Clean neutral 「ですます調」 — no dialect leak.
+#     Sample (Rational): "有理数は整数のペア a/b (b>0) で表現できます。
+#                         ここで a は分子、b は分母です。"
 #   + English originals correctly emitted in <details><summary>Original (en)</summary>
-#     blocks after each JP translation — human verification path works.
-#   ! CAVEAT: translation tone leaked dialect/persona from caller's global CLAUDE.md.
-#     Sample (Rational): "有理数は整数のペア a/b で表現される……のことやな。"
-#     Cause: `claude --model haiku -p -` inherits the user's Claude Code persona setup.
-#     Fix needed: Translator prompt must explicitly require neutral/standard Japanese
-#     and forbid persona/dialect adoption. Open as follow-up before Stage 3 production.
+#     blocks — human verification path works.
+#   + Markdown formatting (code fences, **, backticks) preserved through translation.
 #
-# Empty translations:
-#   Ruby::Box#require / #require_relative came back empty because the source RDoc
-#   has no <div class="method-description"> content (C-level method, undocumented).
-#   Not a translator bug. Formatter could optionally skip empty method blocks.
+# Persona fix (committed): Translator default_runner now invokes claude with
+#   chdir: '/tmp' so user's ~/CLAUDE.md persona file is not picked up.
+#   Cache key bumped to v2 so prior contaminated entries are unreachable.
 #
-# Status: DONE_WITH_CONCERNS — proceed to followup (Translator prompt hardening)
-#         before Stage 3 integration.
+# Empty translations (not a bug):
+#   Ruby::Box#require / #require_relative come back empty because the source RDoc
+#   has no <div class="method-description"> (C-level methods, undocumented).
+#   Translator correctly returns '' for nil/empty input. Formatter could optionally
+#   skip empty method sections — deferred.
+#
+# Status: DONE — quality acceptable, ready for Stage 3 integration.
 
 require 'bundler/setup'
 require 'timeout'
