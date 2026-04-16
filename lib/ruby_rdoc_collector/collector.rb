@@ -1,6 +1,7 @@
 module RubyRdocCollector
   class Collector
-    SOURCE_PREFIX = 'ruby/ruby:rdoc/trunk'
+    SOURCE_PREFIX  = 'ruby/ruby:rdoc/trunk'
+    THREAD_POOL_SIZE = 4
 
     def initialize(config,
                    fetcher:    nil,
@@ -26,14 +27,56 @@ module RubyRdocCollector
 
     def safe_translate_and_format(entity)
       jp_desc    = @translator.translate(entity.description)
-      jp_methods = entity.methods.to_h do |m|
-        [m.name, @translator.translate(m.description)]
-      end
-      content = @formatter.format(entity, jp_description: jp_desc, jp_method_descriptions: jp_methods)
+      en_desc    = entity.description
+
+      jp_methods = parallel_translate(entity.methods, threads: THREAD_POOL_SIZE) do |m|
+        begin
+          [m.name, @translator.translate(m.description)]
+        rescue Translator::TranslationError => e
+          warn "[RubyRdocCollector::Collector] skip method #{entity.name}##{m.name}: #{e.message}"
+          [m.name, '']
+        end
+      end.to_h
+
+      en_methods = entity.methods.to_h { |m| [m.name, m.description || ''] }
+
+      content = @formatter.format(entity,
+        jp_description:         jp_desc,
+        jp_method_descriptions: jp_methods,
+        en_description:         en_desc,
+        en_method_descriptions: en_methods)
       { content: content, source: "#{SOURCE_PREFIX}/#{entity.name}" }
     rescue Translator::TranslationError => e
       warn "[RubyRdocCollector::Collector] skip #{entity.name}: #{e.message}"
       nil
+    end
+
+    # Parallel translation helper using a fixed-size thread pool.
+    # @param items  [Array]  items to process
+    # @param threads [Integer] pool size
+    # @yield [item] block receives each item; must return the result
+    # @return [Array] results in the same order as items
+    def parallel_translate(items, threads:, &block)
+      return [] if items.empty?
+
+      results  = Array.new(items.size)
+      queue    = Queue.new
+      items.each_with_index { |item, i| queue << [i, item] }
+
+      workers = [threads, items.size].min.times.map do
+        Thread.new do
+          until queue.empty?
+            begin
+              idx, item = queue.pop(true)  # non-blocking
+            rescue ThreadError
+              break  # queue empty
+            end
+            results[idx] = block.call(item)
+          end
+        end
+      end
+      workers.each(&:join)
+      results
     end
   end
 end

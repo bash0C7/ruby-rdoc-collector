@@ -79,4 +79,87 @@ class TestCollector < Test::Unit::TestCase
     r2 = c.collect
     assert_equal r1, r2
   end
+
+  # C. parallel method translation + en_ wiring
+  def test_all_methods_translated_in_parallel
+    # Entity with 5 methods
+    methods = (1..5).map do |i|
+      RubyRdocCollector::MethodEntry.new(
+        name: "method_#{i}", call_seq: nil, description: "desc #{i}"
+      )
+    end
+    entity = RubyRdocCollector::ClassEntity.new(
+      name: 'Multi', description: 'class desc', methods: methods, constants: [], superclass: 'Object'
+    )
+
+    invocation_count = Concurrent::AtomicFixnum.new(0) rescue nil
+    # Use a thread-safe counter via Mutex
+    mutex   = Mutex.new
+    counter = 0
+    counting_runner = lambda do |_prompt|
+      mutex.synchronize { counter += 1 }
+      'JP'
+    end
+    cache = RubyRdocCollector::TranslationCache.new(cache_dir: Dir.mktmpdir('cpara'))
+    counting_translator = RubyRdocCollector::Translator.new(runner: counting_runner, cache: cache, sleeper: ->(_s) {})
+
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    StubFetcher.new('/fake'),
+      parser:     StubParser.new([entity]),
+      translator: counting_translator,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new)
+    results = c.collect
+    assert_equal 1, results.size
+    # 1 call for class description + 5 for methods = 6 total
+    assert_equal 6, counter
+  end
+
+  def test_method_translation_error_per_method_does_not_kill_class
+    # One method always fails, others succeed; class should still appear in results
+    methods = [
+      RubyRdocCollector::MethodEntry.new(name: 'ok1',    call_seq: nil, description: 'ok desc 1'),
+      RubyRdocCollector::MethodEntry.new(name: 'bad',    call_seq: nil, description: 'FAIL THIS'),
+      RubyRdocCollector::MethodEntry.new(name: 'ok2',    call_seq: nil, description: 'ok desc 2'),
+    ]
+    entity = RubyRdocCollector::ClassEntity.new(
+      name: 'PartialMethod', description: 'class desc', methods: methods, constants: [], superclass: 'Object'
+    )
+    error_runner = lambda do |prompt|
+      raise RubyRdocCollector::Translator::TranslationError, 'boom' if prompt.include?('FAIL THIS')
+      'JP'
+    end
+    cache = RubyRdocCollector::TranslationCache.new(cache_dir: Dir.mktmpdir('cperr'))
+    boom_translator = RubyRdocCollector::Translator.new(runner: error_runner, cache: cache, max_retries: 1, sleeper: ->(_s) {})
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    StubFetcher.new('/fake'),
+      parser:     StubParser.new([entity]),
+      translator: boom_translator,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new)
+    results = c.collect
+    # Class should still be in results (not skipped entirely)
+    assert_equal 1, results.size
+    assert_include results.first[:source], 'PartialMethod'
+  end
+
+  def test_en_description_and_method_descriptions_wired_to_formatter
+    # Verify that en_ fields appear in the output via <details> blocks
+    methods = [
+      RubyRdocCollector::MethodEntry.new(name: 'greet', call_seq: nil, description: 'Says hello.')
+    ]
+    entity = RubyRdocCollector::ClassEntity.new(
+      name: 'Greeter', description: 'A greeter class.', methods: methods, constants: [], superclass: 'Object'
+    )
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    StubFetcher.new('/fake'),
+      parser:     StubParser.new([entity]),
+      translator: @translator,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new)
+    results = c.collect
+    assert_equal 1, results.size
+    content = results.first[:content]
+    # English original details block for class description
+    assert_include content, '<details>'
+    assert_include content, 'A greeter class.'
+    assert_include content, 'Says hello.'
+  end
 end
