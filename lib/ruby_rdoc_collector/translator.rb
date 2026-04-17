@@ -10,6 +10,7 @@ module RubyRdocCollector
     RETRY_WAIT_SECONDS  = 10
     NEUTRAL_CWD         = '/tmp'   # avoid inheriting ~/CLAUDE.md persona at claude CLI invocation
     CACHE_KEY_VERSION   = 'v3'     # bump when prompt or invocation env changes (v3: added 標準語 directive)
+    DEFAULT_CONCURRENCY = 4        # default cap on concurrent claude CLI invocations
 
     PROMPT_HEADER = <<~HEADER
       # 出力言語の強制指定（最優先）
@@ -34,12 +35,14 @@ module RubyRdocCollector
 
     attr_reader :model
 
-    def initialize(runner: nil, cache: TranslationCache.new, max_retries: DEFAULT_MAX_RETRIES, sleeper: ->(sec) { sleep(sec) }, model: DEFAULT_MODEL)
+    def initialize(runner: nil, cache: TranslationCache.new, max_retries: DEFAULT_MAX_RETRIES,
+                   sleeper: ->(sec) { sleep(sec) }, model: DEFAULT_MODEL, semaphore: nil)
       @model       = model
       @runner      = runner || default_runner
       @cache       = cache
       @max_retries = max_retries
       @sleeper     = sleeper
+      @semaphore   = semaphore || ClaudeSemaphore.new(DEFAULT_CONCURRENCY)
     end
 
     def translate(en_text)
@@ -67,7 +70,7 @@ module RubyRdocCollector
       while attempts < @max_retries
         attempts += 1
         begin
-          result = @runner.call(prompt)
+          result = @semaphore.acquire { @runner.call(prompt) }
           raise TranslationError, 'empty response' if result.nil? || result.strip.empty?
           return result
         rescue TranslationError => e

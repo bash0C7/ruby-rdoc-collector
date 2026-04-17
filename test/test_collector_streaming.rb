@@ -295,6 +295,66 @@ class TestCollectorStreaming < Test::Unit::TestCase
     assert_nil parser.targets_received
   end
 
+  # class-level parallel processing + yield mutex serialization
+
+  def test_yield_is_serialized_across_class_workers
+    # multiple classes processed in parallel, but yield block must never
+    # be entered concurrently (store.store would otherwise race)
+    entities = (0...20).map { |i| build_entity("C#{i}") }
+    c = build_collector(entities)
+    in_block = 0
+    max_in_block = 0
+    mtx = Mutex.new
+    c.collect do |_r|
+      mtx.synchronize do
+        in_block += 1
+        max_in_block = [max_in_block, in_block].max
+      end
+      sleep 0.005
+      mtx.synchronize { in_block -= 1 }
+    end
+    assert_equal 1, max_in_block, "yield block must be entered by at most 1 class worker at a time"
+  end
+
+  def test_parallel_class_processing_preserves_all_records
+    entities = (0...10).map { |i| build_entity("P#{i}") }
+    c = build_collector(entities)
+    yielded = []
+    mtx = Mutex.new
+    c.collect do |r|
+      mtx.synchronize { yielded << r[:source] }
+    end
+    expected = entities.map { |e| "ruby/ruby:rdoc/trunk/#{e.name}" }.sort
+    assert_equal expected, yielded.sort
+  end
+
+  def test_parallel_processing_persists_all_baseline_entries
+    entities = (0...8).map { |i| build_entity("B#{i}") }
+    c = build_collector(entities)
+    c.collect { |_| }
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    entities.each do |e|
+      hash = @baseline.hash_for(e)
+      assert_false b2.changed?(e.name, hash),
+        "baseline must contain persisted hash for #{e.name} after parallel run"
+    end
+  end
+
+  def test_class_workers_overlap_claude_calls_wall_time
+    # Slow runner makes each claude call take 50ms. Default semaphore cap is 4.
+    # 4 classes × 1 call each → serial would be 4*50=200ms; parallel ~50ms.
+    slow_runner = ->(_p) { sleep 0.05; 'JP' }
+    cache = RubyRdocCollector::TranslationCache.new(cache_dir: File.join(@dir, 'sc'))
+    slow_translator = RubyRdocCollector::Translator.new(runner: slow_runner, cache: cache, sleeper: ->(_) {})
+    entities = (0...4).map { |i| build_entity("Slow#{i}") }
+    c = build_collector(entities, translator: slow_translator)
+    t0 = Time.now
+    c.collect { |_| }
+    elapsed = Time.now - t0
+    # Generous upper bound to stay CI-resilient while still catching the regression
+    assert elapsed < 0.15, "expected class-level parallelism (~50ms); got #{elapsed}s"
+  end
+
   # output_dir exposure for Rake task
 
   def test_output_dir_is_accessible

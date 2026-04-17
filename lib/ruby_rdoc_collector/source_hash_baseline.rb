@@ -9,9 +9,10 @@ module RubyRdocCollector
     DEFAULT_PATH = File.expand_path('~/.cache/ruby-rdoc-collector/source_hashes.yml')
 
     def initialize(path: DEFAULT_PATH)
-      @path = path
-      @map  = load_from_disk
-      @seen = Set.new
+      @path  = path
+      @map   = load_from_disk
+      @seen  = Set.new
+      @mutex = Mutex.new
     end
 
     def hash_for(entity)
@@ -25,27 +26,33 @@ module RubyRdocCollector
     end
 
     def changed?(class_name, new_hash)
-      @map[class_name] != new_hash
+      @mutex.synchronize { @map[class_name] != new_hash }
     end
 
     def populated?
-      !@map.empty?
+      @mutex.synchronize { !@map.empty? }
     end
 
     def mark_seen(class_name)
-      @seen << class_name
+      @mutex.synchronize { @seen << class_name }
       self
     end
 
     def persist_one(class_name, new_hash)
-      @map[class_name] = new_hash
-      atomic_write(@map)
+      snapshot = @mutex.synchronize do
+        @map[class_name] = new_hash
+        @map.dup
+      end
+      atomic_write(snapshot)
       self
     end
 
     def cleanup_orphans
-      (@map.keys - @seen.to_a).each { |k| @map.delete(k) }
-      atomic_write(@map)
+      snapshot = @mutex.synchronize do
+        (@map.keys - @seen.to_a).each { |k| @map.delete(k) }
+        @map.dup
+      end
+      atomic_write(snapshot)
       self
     end
 

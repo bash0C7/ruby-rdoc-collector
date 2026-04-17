@@ -3,7 +3,10 @@ require 'fileutils'
 module RubyRdocCollector
   class Collector
     SOURCE_PREFIX    = 'ruby/ruby:rdoc/trunk'
-    THREAD_POOL_SIZE = 4
+    THREAD_POOL_SIZE = 4   # method-level concurrency within a class
+    CLASS_POOL_SIZE  = 4   # class-level concurrency; total claude calls are globally
+                           # capped by Translator's semaphore, so this can safely be
+                           # >= THREAD_POOL_SIZE without exceeding claude budget.
 
     attr_reader :output_dir
 
@@ -40,7 +43,7 @@ module RubyRdocCollector
       entities = @parser.parse(content_dir, targets: targets)
       entities = apply_max_methods_filter(entities)
 
-      entities.each { |entity| process_entity(entity, &block) }
+      process_entities_in_pool(entities, &block)
 
       @baseline.cleanup_orphans unless smoke_filter_active? || entities.empty?
     end
@@ -59,7 +62,33 @@ module RubyRdocCollector
       max_methods && max_methods > 0
     end
 
-    def process_entity(entity, &block)
+    # Spawn CLASS_POOL_SIZE worker threads that pull entities from a shared
+    # queue. Each worker does the full per-entity pipeline; the final yield
+    # is serialized via @yield_mutex so the caller's block (typically
+    # store.store) observes a single-writer DB contract.
+    def process_entities_in_pool(entities, &block)
+      return if entities.empty?
+
+      yield_mutex = Mutex.new
+      queue       = Queue.new
+      entities.each { |e| queue << e }
+
+      workers = [CLASS_POOL_SIZE, entities.size].min.times.map do
+        Thread.new do
+          until queue.empty?
+            begin
+              entity = queue.pop(true)
+            rescue ThreadError
+              break
+            end
+            process_entity(entity, yield_mutex, &block)
+          end
+        end
+      end
+      workers.each(&:join)
+    end
+
+    def process_entity(entity, yield_mutex, &block)
       @baseline.mark_seen(entity.name)
       new_hash = @baseline.hash_for(entity)
       return unless @baseline.changed?(entity.name, new_hash)
@@ -76,7 +105,7 @@ module RubyRdocCollector
       end
 
       begin
-        yield record
+        yield_mutex.synchronize { block.call(record) }
       rescue => e
         warn "[RubyRdocCollector::Collector] yield failed for #{entity.name}: #{e.message}"
         return

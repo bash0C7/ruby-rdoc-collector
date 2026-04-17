@@ -125,4 +125,40 @@ class TestTranslator < Test::Unit::TestCase
     # The test exists to force explicit acknowledgement when bumping (update the expected version).
     assert_equal 'v3', RubyRdocCollector::Translator::CACHE_KEY_VERSION
   end
+
+  # C. semaphore gating: max concurrent claude calls across threads
+
+  def test_concurrent_runner_calls_are_capped_by_semaphore
+    sem = RubyRdocCollector::ClaudeSemaphore.new(2)
+    in_flight = 0
+    max_in_flight = 0
+    mtx = Mutex.new
+    runner = lambda do |_prompt|
+      mtx.synchronize do
+        in_flight += 1
+        max_in_flight = [max_in_flight, in_flight].max
+      end
+      sleep 0.02
+      mtx.synchronize { in_flight -= 1 }
+      'JP'
+    end
+    # per-thread separate cache to avoid cache hits that'd bypass runner
+    threads = 10.times.map do |i|
+      Thread.new do
+        cache = RubyRdocCollector::TranslationCache.new(cache_dir: Dir.mktmpdir("tsem#{i}"))
+        t = RubyRdocCollector::Translator.new(runner: runner, cache: cache, sleeper: @no_sleep, semaphore: sem)
+        t.translate("unique text #{i}")
+      end
+    end
+    threads.each(&:join)
+    assert_equal 2, max_in_flight, "concurrent runner calls must be capped at semaphore size (saw #{max_in_flight})"
+  end
+
+  def test_default_semaphore_allows_single_thread_usage
+    # Sanity: no semaphore injection → default semaphore used, single-threaded tests still work
+    runner = EchoRunner.new(response: 'JP')
+    t = RubyRdocCollector::Translator.new(runner: runner, cache: @cache, sleeper: @no_sleep)
+    assert_equal 'JP', t.translate('hello')
+    assert_equal 1, runner.calls
+  end
 end

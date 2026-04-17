@@ -145,4 +145,24 @@ class TestSourceHashBaseline < Test::Unit::TestCase
     b2 = RubyRdocCollector::SourceHashBaseline.new(path: @path)
     assert b2.populated?
   end
+
+  # thread safety: concurrent mark_seen + persist_one from multiple threads
+  def test_concurrent_mutations_produce_consistent_final_state
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    names = (0...100).map { |i| "Class#{i}" }
+    threads = names.each_slice(10).map do |batch|
+      Thread.new do
+        batch.each do |name|
+          b.mark_seen(name)
+          b.persist_one(name, "hash_#{name}")
+        end
+      end
+    end
+    threads.each(&:join)
+    reloaded = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    names.each do |name|
+      assert_false reloaded.changed?(name, "hash_#{name}"),
+        "expected baseline to have #{name} persisted"
+    end
+  end
 end
