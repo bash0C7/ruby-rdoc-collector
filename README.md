@@ -1,6 +1,6 @@
 # ruby_rdoc_collector
 
-Collector that downloads pre-built RDoc darkfish HTML from `cache.ruby-lang.org`, parses per-class data, translates English descriptions into Japanese via Claude CLI (`haiku`), and streams `{content:, source:}` records to the [ruby-knowledge-db](https://github.com/bash0C7/ruby-knowledge-db) pipeline.
+Collector that downloads pre-built RDoc darkfish HTML from `cache.ruby-lang.org`, parses per-class data, and streams `{content:, source:}` records to the [ruby-knowledge-db](https://github.com/bash0C7/ruby-knowledge-db) pipeline. Content is stored in English as-is; on-demand Japanese translation for queries and display is handled by the host LLM agent downstream (see chiebukuro-mcp meta hints).
 
 ## Data source
 
@@ -31,79 +31,27 @@ collector.collect.each { |record| ... }
 collector.output_dir
 ```
 
-`since:` / `before:` keyword args are accepted for signature compatibility with other collectors but ignored — the tarball is always the latest snapshot.
+## Intermediate MD files
 
-## Per-entity pipeline
+Each yielded record's content is also written to `/tmp/ruby-rdoc-<YYYYmmddHHMMSS>/<SanitizedClassName>.md` as a debug artifact. Filenames sanitize `::` → `__` and non-`[A-Za-z0-9_-]` → `_`.
 
-For each parsed class, in order:
+## source_hash baseline
 
-1. `baseline.mark_seen` (for end-of-run orphan cleanup)
-2. Compute source-hash from description + superclass + each method's name / call_seq / description
-3. Skip silently if the hash matches the baseline (no translate / no file / no DB)
-4. Translate class description + method descriptions (4-thread pool for methods inside a class)
-5. Format MD
-6. Write intermediate MD file — failure logs a warning and skips steps 7-8
-7. Yield `{content:, source:}` to the caller — caller exception logs a warning and skips step 8
-8. `baseline.persist_one` atomically (Tempfile + rename)
+Per-class SHA256 (description + superclass + each method's name/call_seq/description) is persisted to `~/.cache/ruby-rdoc-collector/source_hashes.yml`. Unchanged classes are skipped silently; yield-failure leaves the baseline untouched so the next run retries.
 
-After iteration, `baseline.cleanup_orphans` removes per-class entries absent from this run and `baseline.mark_completed` records the completion marker. Both are **skipped when a smoke filter is active** so smoke runs can't wipe the baseline or advance the completion bookmark.
-
-## Concurrency
-
-`Translator` wraps every claude CLI invocation in a `ClaudeSemaphore` (default 4 slots) so the maximum number of concurrent claude subprocesses is bounded regardless of how many threads call `translate`. `Collector` runs `CLASS_POOL_SIZE` (default 4) class workers in parallel — each worker pulls an entity from a shared queue and runs the full per-entity pipeline. The yield to the caller's block is serialized by a `Mutex` so `store.store` observes a single-writer contract (SQLite WAL friendly). `SourceHashBaseline` guards its internal map with a mutex and writes atomic snapshots so baseline I/O never happens under the lock.
+The baseline file is a two-phase bookmark: `mark_started` is written at the top of a non-smoke collect, `mark_completed` only after `cleanup_orphans` finishes. A run that is started but not completed is treated as WIP and re-processed on the next call.
 
 ## Fast path
 
-When all of the following hold, `collect` returns immediately with no parse, translate, or file I/O:
+If `fetcher.unchanged?` (tarball SHA matches the last run) AND `baseline.completed?` AND smoke filters are inactive, `collect` returns immediately without parsing. Any change to either the tarball or baseline WIP state re-engages the full pipeline.
 
-- `fetcher.unchanged?` — tarball SHA256 matches the last extracted tarball
-- `baseline.completed?` — the most recent run was marked completed (two-phase bookmark)
-- no smoke filter active
+## Smoke / escape hatches
 
-The baseline records `last_started_at` at the top of every non-smoke `collect` and `last_completed_at` only after `cleanup_orphans` succeeds. An interrupted run leaves `last_started_at > last_completed_at`, so `completed?` returns false and the next invocation resumes the full pipeline instead of fast-pathing.
+- `RUBY_RDOC_TARGETS=ClassA,ClassB` — only parse listed classes
+- `RUBY_RDOC_MAX_METHODS=N` — cap methods per class to first N
 
-## Smoke / integration escape hatches
+Smoke runs never advance the completion marker and never orphan-cleanup.
 
-| env var | effect |
-|---|---|
-| `RUBY_RDOC_TARGETS=Array,Hash` | Parser pre-filters to listed classes; only those are parsed |
-| `RUBY_RDOC_MAX_METHODS=20` | Cap methods/class to first N after parse |
+## Cache
 
-When either is set, `cleanup_orphans` is skipped and the fast path is bypassed so the smoke run always exercises the pipeline.
-
-## Caches
-
-| Path | Purpose |
-|---|---|
-| `~/.cache/ruby-rdoc-collector/tarball/ruby-docs-en-master.tar.xz` | downloaded tarball |
-| `~/.cache/ruby-rdoc-collector/tarball/extracted/` | extracted HTML tree |
-| `~/.cache/ruby-rdoc-collector/tarball/tarball.sha256` | SHA256 of the tarball behind the current extracted tree; re-extract is skipped when it still matches |
-| `~/.cache/ruby-rdoc-collector/tarball/*.etag` | `curl --etag-compare` state for HTTP 304 short-circuit |
-| `~/.cache/ruby-rdoc-collector/translations/<shard>/<key>` | haiku JP output keyed by SHA256; prompt-unchanged retranslation is a cache hit |
-| `~/.cache/ruby-rdoc-collector/source_hashes.yml` | per-class English-source fingerprint + two-phase bookmark (`last_started_at` / `last_completed_at`); identical content skips the full pipeline, partial runs are resumed |
-
-Intermediate MD files (debug artifacts, not auto-cleaned):
-
-`/tmp/ruby-rdoc-<YYYYmmddHHMMSS>/<SanitizedClassName>.md`
-
-`::` in class names becomes `__`; other non-word characters become `_`.
-
-## Translation cache key
-
-```
-SHA256("v3|haiku\n" + en_text)
-```
-
-The version prefix is bumped whenever the prompt or invocation environment changes, invalidating stale entries atomically.
-
-## Translation prompt
-
-`PROMPT_HEADER` opens with a top-priority directive mandating Japanese 標準語 output and forbidding dialects / emoticons / colloquial sentence endings. This counters user-level Claude CLI persona config that would otherwise bleed through regardless of `chdir`.
-
-The Translator subprocess runs with `chdir: '/tmp'` to skip project-level `CLAUDE.md` pickup.
-
-## Test
-
-```bash
-bundle exec rake test
-```
+`~/.cache/ruby-rdoc-collector/tarball/` holds the downloaded `ruby-docs-en-master.tar.xz` and its extracted content. Subsequent runs reuse it unless the upstream SHA changes.
