@@ -194,7 +194,7 @@ class TestCollectorStreaming < Test::Unit::TestCase
       'Gone must NOT be purged when MAX_METHODS is active'
   end
 
-  # fast-path: tarball unchanged + baseline populated → skip parse/translate/store entirely
+  # fast-path: tarball unchanged + baseline populated → skip parse/store entirely
 
   class UnchangedFetcher
     attr_reader :fetch_count
