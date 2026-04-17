@@ -102,4 +102,27 @@ class TestTranslator < Test::Unit::TestCase
     # For default_runner args, we test via model accessor.
     assert_equal 'haiku', t.model
   end
+
+  # B. prompt header enforces standard Japanese (counters ~/.claude config persona bleed)
+  def test_prompt_header_enforces_standard_japanese
+    header = RubyRdocCollector::Translator::PROMPT_HEADER
+    assert_include header, '標準語'
+    assert_include header, '最優先'
+    # explicit ban phrase to resist future header edits that soften the directive
+    assert_match(/関西弁.*使用禁止|使用禁止.*関西弁/m, header)
+  end
+
+  def test_prompt_header_included_in_runner_invocation
+    captured_prompt = nil
+    capturing_runner = lambda { |p| captured_prompt = p; 'JP' }
+    t = RubyRdocCollector::Translator.new(runner: capturing_runner, cache: @cache, sleeper: @no_sleep)
+    t.translate('Hello')
+    assert_include captured_prompt, '標準語'
+  end
+
+  def test_cache_key_version_is_v3
+    # Cache key bump is intentional; changing this constant invalidates all cached translations.
+    # The test exists to force explicit acknowledgement when bumping (update the expected version).
+    assert_equal 'v3', RubyRdocCollector::Translator::CACHE_KEY_VERSION
+  end
 end
