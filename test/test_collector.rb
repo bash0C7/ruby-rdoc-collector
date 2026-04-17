@@ -1,18 +1,12 @@
 require_relative 'test_helper'
 
 class TestCollector < Test::Unit::TestCase
-  class StubFetcher
-    def initialize(dir); @dir = dir; end
-    def fetch; @dir; end
-  end
-
-  class StubParser
-    def initialize(entities); @entities = entities; end
-    def parse(_dir); @entities; end
-  end
+  include RubyRdocCollectorTestSupport
 
   def setup
-    @dir   = Dir.mktmpdir('collector')
+    @dir        = Dir.mktmpdir('collector')
+    @baseline   = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    @output_dir = File.join(@dir, 'out')
     cache  = RubyRdocCollector::TranslationCache.new(cache_dir: @dir)
     @translator = RubyRdocCollector::Translator.new(runner: EchoRunner.new(response: 'JP'), cache: cache, sleeper: ->(_s) {})
   end
@@ -29,12 +23,8 @@ class TestCollector < Test::Unit::TestCase
 
   def test_collect_returns_content_and_source_per_class
     entities = [build_entity('String'), build_entity('Integer')]
-    c = RubyRdocCollector::Collector.new({},
-      fetcher:    StubFetcher.new('/fake'),
-      parser:     StubParser.new(entities),
-      translator: @translator,
-      formatter:  RubyRdocCollector::MarkdownFormatter.new)
-    results = c.collect
+    c = build_collector(entities)
+    results = c.collect.to_a
     assert_equal 2, results.size
     results.each do |r|
       assert_kind_of String, r[:content]
@@ -56,12 +46,8 @@ class TestCollector < Test::Unit::TestCase
       max_retries: 1,
       sleeper: ->(_s) {}
     )
-    c = RubyRdocCollector::Collector.new({},
-      fetcher:    StubFetcher.new('/fake'),
-      parser:     StubParser.new(entities),
-      translator: boom_translator,
-      formatter:  RubyRdocCollector::MarkdownFormatter.new)
-    results = c.collect
+    c = build_collector(entities, translator: boom_translator)
+    results = c.collect.to_a
     sources = results.map { |r| r[:source] }
     assert_equal 1, results.size
     assert_include sources, 'ruby/ruby:rdoc/trunk/String'
@@ -70,19 +56,19 @@ class TestCollector < Test::Unit::TestCase
 
   def test_since_and_before_are_ignored
     entities = [build_entity('A')]
-    c = RubyRdocCollector::Collector.new({},
-      fetcher:    StubFetcher.new('/fake'),
-      parser:     StubParser.new(entities),
-      translator: @translator,
-      formatter:  RubyRdocCollector::MarkdownFormatter.new)
-    r1 = c.collect(since: '2020-01-01', before: '2020-01-02')
-    r2 = c.collect
-    assert_equal r1, r2
+    c = build_collector(entities)
+    r1 = c.collect(since: '2020-01-01', before: '2020-01-02').to_a
+    # fresh baseline + output_dir so second run yields too (else source_hash would skip)
+    fresh_baseline = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline2.yml'))
+    c2 = build_collector(entities, baseline: fresh_baseline, output_dir: File.join(@dir, 'out2'))
+    r2 = c2.collect.to_a
+    # since/before ignored: content/source should be identical
+    assert_equal r1.map { |r| r[:source] }, r2.map { |r| r[:source] }
+    assert_equal r1.map { |r| r[:content] }, r2.map { |r| r[:content] }
   end
 
   # C. parallel method translation + en_ wiring
   def test_all_methods_translated_in_parallel
-    # Entity with 5 methods
     methods = (1..5).map do |i|
       RubyRdocCollector::MethodEntry.new(
         name: "method_#{i}", call_seq: nil, description: "desc #{i}"
@@ -92,8 +78,6 @@ class TestCollector < Test::Unit::TestCase
       name: 'Multi', description: 'class desc', methods: methods, constants: [], superclass: 'Object'
     )
 
-    invocation_count = Concurrent::AtomicFixnum.new(0) rescue nil
-    # Use a thread-safe counter via Mutex
     mutex   = Mutex.new
     counter = 0
     counting_runner = lambda do |_prompt|
@@ -103,19 +87,14 @@ class TestCollector < Test::Unit::TestCase
     cache = RubyRdocCollector::TranslationCache.new(cache_dir: Dir.mktmpdir('cpara'))
     counting_translator = RubyRdocCollector::Translator.new(runner: counting_runner, cache: cache, sleeper: ->(_s) {})
 
-    c = RubyRdocCollector::Collector.new({},
-      fetcher:    StubFetcher.new('/fake'),
-      parser:     StubParser.new([entity]),
-      translator: counting_translator,
-      formatter:  RubyRdocCollector::MarkdownFormatter.new)
-    results = c.collect
+    c = build_collector([entity], translator: counting_translator)
+    results = c.collect.to_a
     assert_equal 1, results.size
     # 1 call for class description + 5 for methods = 6 total
     assert_equal 6, counter
   end
 
   def test_method_translation_error_per_method_does_not_kill_class
-    # One method always fails, others succeed; class should still appear in results
     methods = [
       RubyRdocCollector::MethodEntry.new(name: 'ok1',    call_seq: nil, description: 'ok desc 1'),
       RubyRdocCollector::MethodEntry.new(name: 'bad',    call_seq: nil, description: 'FAIL THIS'),
@@ -130,13 +109,8 @@ class TestCollector < Test::Unit::TestCase
     end
     cache = RubyRdocCollector::TranslationCache.new(cache_dir: Dir.mktmpdir('cperr'))
     boom_translator = RubyRdocCollector::Translator.new(runner: error_runner, cache: cache, max_retries: 1, sleeper: ->(_s) {})
-    c = RubyRdocCollector::Collector.new({},
-      fetcher:    StubFetcher.new('/fake'),
-      parser:     StubParser.new([entity]),
-      translator: boom_translator,
-      formatter:  RubyRdocCollector::MarkdownFormatter.new)
-    results = c.collect
-    # Class should still be in results (not skipped entirely)
+    c = build_collector([entity], translator: boom_translator)
+    results = c.collect.to_a
     assert_equal 1, results.size
     assert_include results.first[:source], 'PartialMethod'
   end
@@ -152,12 +126,8 @@ class TestCollector < Test::Unit::TestCase
 
   def test_targets_env_filters_to_listed_classes_only
     entities = [build_entity('Keep1'), build_entity('Drop'), build_entity('Keep2')]
-    c = RubyRdocCollector::Collector.new({},
-      fetcher:    StubFetcher.new('/fake'),
-      parser:     StubParser.new(entities),
-      translator: @translator,
-      formatter:  RubyRdocCollector::MarkdownFormatter.new)
-    results = with_env('RUBY_RDOC_TARGETS' => 'Keep1, Keep2') { c.collect }
+    c = build_collector(entities)
+    results = with_env('RUBY_RDOC_TARGETS' => 'Keep1, Keep2') { c.collect.to_a }
     sources = results.map { |r| r[:source] }
     assert_equal 2, results.size
     assert_include sources, 'ruby/ruby:rdoc/trunk/Keep1'
@@ -177,33 +147,23 @@ class TestCollector < Test::Unit::TestCase
     counting = lambda { |_p| mutex.synchronize { counter += 1 }; 'JP' }
     cache = RubyRdocCollector::TranslationCache.new(cache_dir: Dir.mktmpdir('csmoke'))
     t = RubyRdocCollector::Translator.new(runner: counting, cache: cache, sleeper: ->(_s) {})
-    c = RubyRdocCollector::Collector.new({},
-      fetcher:    StubFetcher.new('/fake'),
-      parser:     StubParser.new([entity]),
-      translator: t,
-      formatter:  RubyRdocCollector::MarkdownFormatter.new)
-    with_env('RUBY_RDOC_MAX_METHODS' => '3') { c.collect }
+    c = build_collector([entity], translator: t)
+    with_env('RUBY_RDOC_MAX_METHODS' => '3') { c.collect.to_a }
     # 1 class desc + 3 methods (capped from 10) = 4 calls
     assert_equal 4, counter
   end
 
   def test_en_description_and_method_descriptions_wired_to_formatter
-    # Verify that en_ fields appear in the output via <details> blocks
     methods = [
       RubyRdocCollector::MethodEntry.new(name: 'greet', call_seq: nil, description: 'Says hello.')
     ]
     entity = RubyRdocCollector::ClassEntity.new(
       name: 'Greeter', description: 'A greeter class.', methods: methods, constants: [], superclass: 'Object'
     )
-    c = RubyRdocCollector::Collector.new({},
-      fetcher:    StubFetcher.new('/fake'),
-      parser:     StubParser.new([entity]),
-      translator: @translator,
-      formatter:  RubyRdocCollector::MarkdownFormatter.new)
-    results = c.collect
+    c = build_collector([entity])
+    results = c.collect.to_a
     assert_equal 1, results.size
     content = results.first[:content]
-    # English original details block for class description
     assert_include content, '<details>'
     assert_include content, 'A greeter class.'
     assert_include content, 'Says hello.'

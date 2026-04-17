@@ -1,0 +1,219 @@
+require_relative 'test_helper'
+
+class TestCollectorStreaming < Test::Unit::TestCase
+  include RubyRdocCollectorTestSupport
+
+  def setup
+    @dir         = Dir.mktmpdir('collector_stream')
+    @baseline    = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    @output_dir  = File.join(@dir, 'out')
+    cache        = RubyRdocCollector::TranslationCache.new(cache_dir: File.join(@dir, 'cache'))
+    @translator  = RubyRdocCollector::Translator.new(
+      runner: EchoRunner.new(response: 'JP'), cache: cache, sleeper: ->(_s) {}
+    )
+  end
+
+  def teardown
+    FileUtils.remove_entry(@dir)
+  end
+
+  def build_entity(name, description: "desc of #{name}", methods: [])
+    RubyRdocCollector::ClassEntity.new(
+      name: name, description: description, methods: methods, constants: [], superclass: 'Object'
+    )
+  end
+
+  # block API: streaming
+
+  def test_collect_with_block_yields_each_record
+    entities = [build_entity('A'), build_entity('B')]
+    c = build_collector(entities)
+    yielded = []
+    c.collect { |r| yielded << r }
+    assert_equal 2, yielded.size
+    sources = yielded.map { |r| r[:source] }
+    assert_include sources, 'ruby/ruby:rdoc/trunk/A'
+    assert_include sources, 'ruby/ruby:rdoc/trunk/B'
+  end
+
+  # no-block API: lazy Enumerator
+
+  def test_collect_without_block_returns_enumerator
+    entities = [build_entity('A')]
+    c = build_collector(entities)
+    result = c.collect
+    assert_kind_of Enumerator, result
+  end
+
+  def test_collect_enumerator_iterates_same_records
+    entities = [build_entity('A'), build_entity('B')]
+    c = build_collector(entities)
+    records = c.collect.to_a
+    assert_equal 2, records.size
+  end
+
+  # source_hash differential skip
+
+  def test_unchanged_entity_is_not_yielded
+    entity = build_entity('A')
+    # pre-seed baseline with current hash — unchanged state
+    @baseline.persist_one('A', @baseline.hash_for(entity))
+    c = build_collector([entity])
+    yielded = []
+    c.collect { |r| yielded << r }
+    assert_empty yielded
+  end
+
+  def test_changed_entity_is_yielded
+    entity = build_entity('A', description: 'old desc')
+    @baseline.persist_one('A', @baseline.hash_for(entity))
+    changed = build_entity('A', description: 'new desc')
+    c = build_collector([changed])
+    yielded = []
+    c.collect { |r| yielded << r }
+    assert_equal 1, yielded.size
+  end
+
+  def test_new_entity_not_in_baseline_is_yielded
+    c = build_collector([build_entity('Brand_New')])
+    yielded = []
+    c.collect { |r| yielded << r }
+    assert_equal 1, yielded.size
+  end
+
+  # intermediate file save
+
+  def test_intermediate_md_written_for_yielded_entity
+    c = build_collector([build_entity('Array')])
+    c.collect { |_| }
+    path = File.join(@output_dir, 'Array.md')
+    assert File.exist?(path), "expected MD at #{path}"
+    assert_include File.read(path), 'Array'
+  end
+
+  def test_intermediate_filename_sanitizes_colons
+    c = build_collector([build_entity('Ruby::Box')])
+    c.collect { |_| }
+    assert File.exist?(File.join(@output_dir, 'Ruby__Box.md'))
+  end
+
+  def test_intermediate_filename_sanitizes_special_chars
+    c = build_collector([build_entity('IO#read')])
+    c.collect { |_| }
+    # '#' is not in [A-Za-z0-9_-], should be replaced with '_'
+    assert File.exist?(File.join(@output_dir, 'IO_read.md'))
+  end
+
+  # file save failure
+
+  def test_file_save_failure_skips_yield_and_baseline_update
+    entity = build_entity('A')
+    failing_writer = ->(_dir, _filename, _content) { raise 'disk full' }
+    c = build_collector([entity], file_writer: failing_writer)
+    yielded = []
+    c.collect { |r| yielded << r }
+    assert_empty yielded, 'yield must not happen when file save fails'
+    # baseline should NOT record this entity
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    assert b2.changed?('A', @baseline.hash_for(entity)),
+      'baseline must not be updated when file save fails'
+  end
+
+  # baseline persistence after successful yield
+
+  def test_baseline_persisted_after_successful_yield
+    entity = build_entity('A')
+    c = build_collector([entity])
+    c.collect { |_| }
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    assert_false b2.changed?('A', @baseline.hash_for(entity))
+  end
+
+  # yield exception semantics (DB store failure)
+
+  def test_yield_exception_skips_baseline_update
+    entity = build_entity('A')
+    c = build_collector([entity])
+    c.collect { |_r| raise 'db error' }
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    assert b2.changed?('A', @baseline.hash_for(entity)),
+      'baseline must not be updated when yield raises'
+  end
+
+  def test_yield_exception_does_not_kill_batch
+    entities = [build_entity('A'), build_entity('B')]
+    c = build_collector(entities)
+    yielded = []
+    c.collect do |r|
+      if r[:source].end_with?('/A')
+        raise 'db error on A'
+      else
+        yielded << r
+      end
+    end
+    sources = yielded.map { |r| r[:source] }
+    assert_include sources, 'ruby/ruby:rdoc/trunk/B'
+  end
+
+  # orphan cleanup at end of run
+
+  def test_cleanup_orphans_removes_entries_not_in_current_parse
+    # pre-seed baseline with A and Gone; parse only sees A
+    @baseline.persist_one('A',    'hash_a_old')
+    @baseline.persist_one('Gone', 'hash_gone')
+    entity = build_entity('A')
+    c = build_collector([entity])
+    c.collect { |_| }
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    assert b2.changed?('Gone', 'hash_gone'), 'Gone must be purged from baseline'
+    assert_false b2.changed?('A', @baseline.hash_for(entity))
+  end
+
+  def with_env(vars)
+    saved = vars.keys.to_h { |k| [k, ENV[k]] }
+    vars.each { |k, v| ENV[k] = v }
+    yield
+  ensure
+    saved.each { |k, v| ENV[k] = v }
+  end
+
+  def test_cleanup_orphans_skipped_when_smoke_targets_active
+    # smoke filter set → baseline entries for unseen classes MUST be preserved
+    @baseline.persist_one('Gone', 'hash_gone')
+    entity = build_entity('A')
+    c = build_collector([entity])
+    with_env('RUBY_RDOC_TARGETS' => 'A') { c.collect { |_| } }
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    assert_false b2.changed?('Gone', 'hash_gone'),
+      'Gone must NOT be purged when smoke TARGETS is active'
+  end
+
+  def test_cleanup_orphans_skipped_when_smoke_max_methods_active
+    @baseline.persist_one('Gone', 'hash_gone')
+    entity = build_entity('A')
+    c = build_collector([entity])
+    with_env('RUBY_RDOC_MAX_METHODS' => '3') { c.collect { |_| } }
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    assert_false b2.changed?('Gone', 'hash_gone'),
+      'Gone must NOT be purged when MAX_METHODS is active'
+  end
+
+  # output_dir exposure for Rake task
+
+  def test_output_dir_is_accessible
+    c = build_collector([])
+    assert_equal @output_dir, c.output_dir
+  end
+
+  # default output_dir timestamped under /tmp when not injected
+
+  def test_default_output_dir_under_tmp
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    StubFetcher.new('/fake'),
+      parser:     StubParser.new([]),
+      translator: @translator,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new,
+      baseline:   @baseline)
+    assert_match %r{\A/tmp/ruby-rdoc-\d{14}\z}, c.output_dir
+  end
+end

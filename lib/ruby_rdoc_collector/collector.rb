@@ -1,30 +1,90 @@
+require 'fileutils'
+
 module RubyRdocCollector
   class Collector
-    SOURCE_PREFIX  = 'ruby/ruby:rdoc/trunk'
+    SOURCE_PREFIX    = 'ruby/ruby:rdoc/trunk'
     THREAD_POOL_SIZE = 4
 
+    attr_reader :output_dir
+
     def initialize(config,
-                   fetcher:    nil,
-                   parser:     nil,
-                   translator: nil,
-                   formatter:  nil)
-      @config     = config || {}
-      @fetcher    = fetcher    || TarballFetcher.new(
+                   fetcher:     nil,
+                   parser:      nil,
+                   translator:  nil,
+                   formatter:   nil,
+                   baseline:    nil,
+                   output_dir:  nil,
+                   file_writer: nil)
+      @config      = config || {}
+      @fetcher     = fetcher    || TarballFetcher.new(
         url: @config['url'] || TarballFetcher::DEFAULT_URL
       )
-      @parser     = parser     || HtmlParser.new
-      @translator = translator || Translator.new
-      @formatter  = formatter  || MarkdownFormatter.new
+      @parser      = parser     || HtmlParser.new
+      @translator  = translator || Translator.new
+      @formatter   = formatter  || MarkdownFormatter.new
+      @baseline    = baseline   || SourceHashBaseline.new
+      @output_dir  = output_dir || default_output_dir
+      @file_writer = file_writer || method(:default_file_write)
     end
 
-    def collect(since: nil, before: nil)
+    def collect(since: nil, before: nil, &block)
+      return enum_for(:collect, since: since, before: before) unless block_given?
+
       content_dir = @fetcher.fetch
-      entities = @parser.parse(content_dir)
-      entities = apply_smoke_filters(entities)
-      entities.filter_map { |e| safe_translate_and_format(e) }
+      entities    = apply_smoke_filters(@parser.parse(content_dir))
+
+      entities.each { |entity| process_entity(entity, &block) }
+
+      @baseline.cleanup_orphans unless smoke_filter_active? || entities.empty?
     end
 
     private
+
+    def smoke_filter_active?
+      targets_raw = ENV['RUBY_RDOC_TARGETS']
+      return true if targets_raw && !targets_raw.strip.empty?
+      max_methods = ENV['RUBY_RDOC_MAX_METHODS']&.to_i
+      max_methods && max_methods > 0
+    end
+
+    def process_entity(entity, &block)
+      @baseline.mark_seen(entity.name)
+      new_hash = @baseline.hash_for(entity)
+      return unless @baseline.changed?(entity.name, new_hash)
+
+      record = safe_translate_and_format(entity)
+      return unless record
+
+      filename = sanitize_filename(entity.name) + '.md'
+      begin
+        @file_writer.call(@output_dir, filename, record[:content])
+      rescue => e
+        warn "[RubyRdocCollector::Collector] file save failed for #{entity.name}: #{e.message}"
+        return
+      end
+
+      begin
+        yield record
+      rescue => e
+        warn "[RubyRdocCollector::Collector] yield failed for #{entity.name}: #{e.message}"
+        return
+      end
+
+      @baseline.persist_one(entity.name, new_hash)
+    end
+
+    def sanitize_filename(class_name)
+      class_name.gsub('::', '__').gsub(/[^A-Za-z0-9_\-]/, '_')
+    end
+
+    def default_output_dir
+      "/tmp/ruby-rdoc-#{Time.now.strftime('%Y%m%d%H%M%S')}"
+    end
+
+    def default_file_write(dir, filename, content)
+      FileUtils.mkdir_p(dir)
+      File.write(File.join(dir, filename), content)
+    end
 
     # Smoke / integration-test escape hatches via env vars.
     # Default behavior unchanged (no filter, no cap) when both vars are unset/empty.
@@ -69,11 +129,6 @@ module RubyRdocCollector
       nil
     end
 
-    # Parallel translation helper using a fixed-size thread pool.
-    # @param items  [Array]  items to process
-    # @param threads [Integer] pool size
-    # @yield [item] block receives each item; must return the result
-    # @return [Array] results in the same order as items
     def parallel_translate(items, threads:, &block)
       return [] if items.empty?
 
@@ -85,9 +140,9 @@ module RubyRdocCollector
         Thread.new do
           until queue.empty?
             begin
-              idx, item = queue.pop(true)  # non-blocking
+              idx, item = queue.pop(true)
             rescue ThreadError
-              break  # queue empty
+              break
             end
             results[idx] = block.call(item)
           end
