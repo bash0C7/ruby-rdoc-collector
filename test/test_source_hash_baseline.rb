@@ -127,4 +127,22 @@ class TestSourceHashBaseline < Test::Unit::TestCase
     b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
     assert b.changed?('X', 'anything')
   end
+
+  def test_populated_is_false_on_fresh_baseline
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    assert_false b.populated?
+  end
+
+  def test_populated_is_true_after_persist_one
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    b.persist_one('A', 'hash1')
+    assert b.populated?
+  end
+
+  def test_populated_survives_reload
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    b.persist_one('A', 'hash1')
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    assert b2.populated?
+  end
 end

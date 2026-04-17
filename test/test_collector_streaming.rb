@@ -198,6 +198,103 @@ class TestCollectorStreaming < Test::Unit::TestCase
       'Gone must NOT be purged when MAX_METHODS is active'
   end
 
+  # fast-path: tarball unchanged + baseline populated → skip parse/translate/store entirely
+
+  class UnchangedFetcher
+    attr_reader :fetch_count
+    def initialize(dir); @dir = dir; @fetch_count = 0; end
+    def fetch; @fetch_count += 1; @dir; end
+    def unchanged?; true; end
+  end
+
+  class ChangedFetcher
+    def initialize(dir); @dir = dir; end
+    def fetch; @dir; end
+    def unchanged?; false; end
+  end
+
+  class ExplodingParser
+    def parse(_dir, **)
+      raise 'parse must not be called on fast path'
+    end
+  end
+
+  def test_fast_path_skips_parse_when_tarball_unchanged_and_baseline_populated
+    @baseline.persist_one('ExistingClass', 'some_hash')
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    UnchangedFetcher.new('/fake'),
+      parser:     ExplodingParser.new,
+      translator: @translator,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new,
+      baseline:   @baseline,
+      output_dir: @output_dir)
+    yielded = []
+    assert_nothing_raised do
+      c.collect { |r| yielded << r }
+    end
+    assert_empty yielded, 'no entities should be yielded on fast path'
+  end
+
+  def test_fast_path_does_not_apply_when_baseline_empty
+    # tarball unchanged but baseline is empty → still parse+process (first-run recovery)
+    empty_baseline = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'empty.yml'))
+    entity = build_entity('A')
+    c = build_collector([entity], baseline: empty_baseline)
+    # replace fetcher with one that reports unchanged
+    c.instance_variable_set(:@fetcher, UnchangedFetcher.new('/fake'))
+    yielded = []
+    c.collect { |r| yielded << r }
+    assert_equal 1, yielded.size, 'must parse + yield when baseline empty even if tarball unchanged'
+  end
+
+  def test_fast_path_does_not_apply_when_smoke_active
+    # smoke filter must bypass fast path so TARGETS/MAX_METHODS always runs
+    @baseline.persist_one('ExistingClass', 'some_hash')
+    entity = build_entity('A')
+    c = build_collector([entity])
+    c.instance_variable_set(:@fetcher, UnchangedFetcher.new('/fake'))
+    yielded = []
+    with_env('RUBY_RDOC_TARGETS' => 'A') { c.collect { |r| yielded << r } }
+    assert_equal 1, yielded.size, 'smoke filter must defeat fast path'
+  end
+
+  # parser.parse receives targets when smoke TARGETS is active
+
+  class SpyParser
+    attr_reader :targets_received
+    def initialize(entities); @entities = entities; @targets_received = :unset; end
+    def parse(_dir, targets: nil)
+      @targets_received = targets
+      @entities
+    end
+  end
+
+  def test_parser_receives_targets_when_smoke_active
+    parser = SpyParser.new([build_entity('Keep')])
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    RubyRdocCollectorTestSupport::StubFetcher.new('/fake'),
+      parser:     parser,
+      translator: @translator,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new,
+      baseline:   @baseline,
+      output_dir: @output_dir)
+    with_env('RUBY_RDOC_TARGETS' => 'Keep,Other') { c.collect { |_| } }
+    assert_equal %w[Keep Other], parser.targets_received
+  end
+
+  def test_parser_receives_nil_targets_when_smoke_inactive
+    parser = SpyParser.new([build_entity('A')])
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    RubyRdocCollectorTestSupport::StubFetcher.new('/fake'),
+      parser:     parser,
+      translator: @translator,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new,
+      baseline:   @baseline,
+      output_dir: @output_dir)
+    c.collect { |_| }
+    assert_nil parser.targets_received
+  end
+
   # output_dir exposure for Rake task
 
   def test_output_dir_is_accessible

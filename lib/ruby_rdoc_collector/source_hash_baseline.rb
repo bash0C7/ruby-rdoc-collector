@@ -28,6 +28,10 @@ module RubyRdocCollector
       @map[class_name] != new_hash
     end
 
+    def populated?
+      !@map.empty?
+    end
+
     def mark_seen(class_name)
       @seen << class_name
       self

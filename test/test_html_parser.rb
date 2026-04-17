@@ -73,4 +73,28 @@ class TestHtmlParser < Test::Unit::TestCase
     assert_match(/tilde~/, tilde_method.call_seq)
     assert_match(/tilde in its name/, tilde_method.description)
   end
+
+  # targets pre-filter (smoke-mode optimization)
+
+  def test_targets_filter_restricts_entities_before_html_parse
+    entities = @parser.parse(FIXTURE_DIR, targets: ['Ruby::Box'])
+    names = entities.map(&:name)
+    assert_equal ['Ruby::Box'], names
+  end
+
+  def test_targets_nil_returns_all_entities
+    all      = @parser.parse(FIXTURE_DIR)
+    filtered = @parser.parse(FIXTURE_DIR, targets: nil)
+    assert_equal all.map(&:name).sort, filtered.map(&:name).sort
+  end
+
+  def test_targets_empty_array_returns_no_entities
+    entities = @parser.parse(FIXTURE_DIR, targets: [])
+    assert_empty entities
+  end
+
+  def test_targets_filter_with_unknown_class_returns_empty
+    entities = @parser.parse(FIXTURE_DIR, targets: ['NoSuchClass'])
+    assert_empty entities
+  end
 end

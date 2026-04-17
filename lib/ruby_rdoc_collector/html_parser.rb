@@ -6,10 +6,20 @@ module RubyRdocCollector
   class HtmlParser
     class ParseError < StandardError; end
 
-    def parse(extracted_dir)
+    # @param extracted_dir [String] path to the extracted rdoc docset
+    # @param targets [Array<String>, nil] optional whitelist of full class names.
+    #   nil  → return all classes (default, full-run behavior)
+    #   []   → return no classes (fast early-exit path)
+    #   [A]  → return only matching classes, skipping HTML parse for the rest
+    def parse(extracted_dir, targets: nil)
       index = load_search_index(extracted_dir)
       class_entries = index.select { |e| e['type'] == 'class' || e['type'] == 'module' }
       method_entries = index.select { |e| %w[class_method instance_method].include?(e['type']) }
+
+      unless targets.nil?
+        target_set = targets.to_a
+        class_entries = class_entries.select { |e| target_set.include?(e['full_name']) }
+      end
 
       class_entries.filter_map do |cls|
         html_path = File.join(extracted_dir, cls['path'])

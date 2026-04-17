@@ -48,11 +48,15 @@ module RubyRdocCollectorTestSupport
   class StubFetcher
     def initialize(dir); @dir = dir; end
     def fetch; @dir; end
+    def unchanged?; false; end
   end
 
   class StubParser
     def initialize(entities); @entities = entities; end
-    def parse(_dir); @entities; end
+    def parse(_dir, targets: nil)
+      return @entities if targets.nil?
+      @entities.select { |e| targets.include?(e.name) }
+    end
   end
 
   # Build a Collector wired with stubs. Defaults draw from instance variables

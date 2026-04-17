@@ -31,7 +31,14 @@ module RubyRdocCollector
       return enum_for(:collect, since: since, before: before) unless block_given?
 
       content_dir = @fetcher.fetch
-      entities    = apply_smoke_filters(@parser.parse(content_dir))
+
+      # Fast path: tarball unchanged AND baseline populated → nothing to do.
+      # Smoke filters bypass this so TARGETS/MAX_METHODS always run.
+      return if @fetcher.unchanged? && @baseline.populated? && !smoke_filter_active?
+
+      targets  = smoke_targets
+      entities = @parser.parse(content_dir, targets: targets)
+      entities = apply_max_methods_filter(entities)
 
       entities.each { |entity| process_entity(entity, &block) }
 
@@ -40,9 +47,14 @@ module RubyRdocCollector
 
     private
 
+    def smoke_targets
+      raw = ENV['RUBY_RDOC_TARGETS']
+      return nil if raw.nil? || raw.strip.empty?
+      raw.split(',').map(&:strip)
+    end
+
     def smoke_filter_active?
-      targets_raw = ENV['RUBY_RDOC_TARGETS']
-      return true if targets_raw && !targets_raw.strip.empty?
+      return true if smoke_targets
       max_methods = ENV['RUBY_RDOC_MAX_METHODS']&.to_i
       max_methods && max_methods > 0
     end
@@ -86,21 +98,12 @@ module RubyRdocCollector
       File.write(File.join(dir, filename), content)
     end
 
-    # Smoke / integration-test escape hatches via env vars.
-    # Default behavior unchanged (no filter, no cap) when both vars are unset/empty.
-    #   RUBY_RDOC_TARGETS=Ruby::Box,Complex,Rational  → keep only those classes
-    #   RUBY_RDOC_MAX_METHODS=20                      → cap methods/class to first N
-    def apply_smoke_filters(entities)
-      targets_raw = ENV['RUBY_RDOC_TARGETS']
-      if targets_raw && !targets_raw.strip.empty?
-        target_set = targets_raw.split(',').map(&:strip)
-        entities = entities.select { |e| target_set.include?(e.name) }
-      end
+    # RUBY_RDOC_MAX_METHODS=N caps methods/class to first N after parse.
+    # (TARGETS filtering is applied earlier at parse-time via @parser.parse(..., targets:))
+    def apply_max_methods_filter(entities)
       max_methods = ENV['RUBY_RDOC_MAX_METHODS']&.to_i
-      if max_methods && max_methods > 0
-        entities = entities.map { |e| e.with(methods: e.methods.first(max_methods)) }
-      end
-      entities
+      return entities unless max_methods && max_methods > 0
+      entities.map { |e| e.with(methods: e.methods.first(max_methods)) }
     end
 
     def safe_translate_and_format(entity)
