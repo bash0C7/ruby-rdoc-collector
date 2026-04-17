@@ -35,9 +35,14 @@ module RubyRdocCollector
 
       content_dir = @fetcher.fetch
 
-      # Fast path: tarball unchanged AND baseline populated → nothing to do.
-      # Smoke filters bypass this so TARGETS/MAX_METHODS always run.
-      return if @fetcher.unchanged? && @baseline.populated? && !smoke_filter_active?
+      # Fast path: tarball unchanged AND the last run completed cleanly → no-op.
+      # `completed?` distinguishes a finished full run from a partial/interrupted
+      # one; the latter leaves last_started_at > last_completed_at and must be
+      # resumed, not skipped. Smoke filters always bypass the fast path.
+      return if @fetcher.unchanged? && @baseline.completed? && !smoke_filter_active?
+
+      smoke = smoke_filter_active?
+      @baseline.mark_started unless smoke
 
       targets  = smoke_targets
       entities = @parser.parse(content_dir, targets: targets)
@@ -45,7 +50,10 @@ module RubyRdocCollector
 
       process_entities_in_pool(entities, &block)
 
-      @baseline.cleanup_orphans unless smoke_filter_active? || entities.empty?
+      unless smoke
+        @baseline.cleanup_orphans unless entities.empty?
+        @baseline.mark_completed
+      end
     end
 
     private

@@ -219,8 +219,10 @@ class TestCollectorStreaming < Test::Unit::TestCase
     end
   end
 
-  def test_fast_path_skips_parse_when_tarball_unchanged_and_baseline_populated
+  def test_fast_path_skips_parse_when_tarball_unchanged_and_last_run_completed
     @baseline.persist_one('ExistingClass', 'some_hash')
+    @baseline.mark_started
+    @baseline.mark_completed
     c = RubyRdocCollector::Collector.new({},
       fetcher:    UnchangedFetcher.new('/fake'),
       parser:     ExplodingParser.new,
@@ -353,6 +355,53 @@ class TestCollectorStreaming < Test::Unit::TestCase
     elapsed = Time.now - t0
     # Generous upper bound to stay CI-resilient while still catching the regression
     assert elapsed < 0.15, "expected class-level parallelism (~50ms); got #{elapsed}s"
+  end
+
+  # 2-phase bookmark: fast-path uses baseline.completed?, not populated?
+
+  def test_fast_path_triggers_only_when_baseline_completed
+    # baseline has entries + completion marker + tarball unchanged → fast path
+    @baseline.persist_one('X', 'hashx')
+    @baseline.mark_started
+    @baseline.mark_completed
+    c = RubyRdocCollector::Collector.new({},
+      fetcher:    UnchangedFetcher.new('/fake'),
+      parser:     ExplodingParser.new,
+      translator: @translator,
+      formatter:  RubyRdocCollector::MarkdownFormatter.new,
+      baseline:   @baseline,
+      output_dir: @output_dir)
+    assert_nothing_raised { c.collect { |_| } }
+  end
+
+  def test_fast_path_does_not_trigger_for_wip_baseline
+    # populated baseline without mark_completed (partial run) must NOT fast-path
+    @baseline.persist_one('X', 'hashx')
+    @baseline.mark_started  # WIP: started, never completed
+    entity = build_entity('A')
+    c = build_collector([entity])
+    c.instance_variable_set(:@fetcher, UnchangedFetcher.new('/fake'))
+    yielded = []
+    c.collect { |r| yielded << r }
+    assert_equal 1, yielded.size, 'WIP baseline must NOT trigger fast path'
+  end
+
+  def test_collect_marks_started_and_completed_on_successful_full_run
+    entities = [build_entity('A'), build_entity('B')]
+    c = build_collector(entities)
+    c.collect { |_| }
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    assert b2.completed?, 'baseline must be marked completed after successful collect'
+  end
+
+  def test_smoke_run_does_not_mark_started_or_completed
+    # A smoke run (TARGETS active) processes a subset; it should NOT advance
+    # the completion marker (next full run must still run).
+    entity = build_entity('Only')
+    c = build_collector([entity])
+    with_env('RUBY_RDOC_TARGETS' => 'Only') { c.collect { |_| } }
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: File.join(@dir, 'baseline.yml'))
+    assert_false b2.completed?, 'smoke runs must not touch the completion marker'
   end
 
   # output_dir exposure for Rake task

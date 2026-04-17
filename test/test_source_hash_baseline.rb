@@ -117,9 +117,9 @@ class TestSourceHashBaseline < Test::Unit::TestCase
     b.persist_one('A', 'hash1')
     b.mark_seen('A')
     b.cleanup_orphans
-    # check raw YAML file
+    # YAML schema wraps entries under 'entries' key alongside bookmark fields
     data = YAML.load_file(@path)
-    assert_equal({ 'A' => 'hash1' }, data)
+    assert_equal({ 'A' => 'hash1' }, data['entries'])
   end
 
   def test_nonexistent_file_treated_as_empty
@@ -164,5 +164,80 @@ class TestSourceHashBaseline < Test::Unit::TestCase
       assert_false reloaded.changed?(name, "hash_#{name}"),
         "expected baseline to have #{name} persisted"
     end
+  end
+
+  # 2-phase bookmark: last_started_at / last_completed_at for WIP detection
+
+  def test_completed_is_false_on_fresh_baseline
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    assert_false b.completed?
+  end
+
+  def test_completed_is_false_after_only_mark_started
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    b.mark_started
+    assert_false b.completed?, 'partial run (started, not completed) must report not completed'
+  end
+
+  def test_completed_is_true_after_mark_started_then_mark_completed
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    b.mark_started
+    b.mark_completed
+    assert b.completed?
+  end
+
+  def test_new_mark_started_invalidates_previous_completion
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    b.mark_started
+    b.mark_completed
+    sleep 0.01 # ensure distinct timestamps
+    b.mark_started
+    assert_false b.completed?, 'a new run-start must invalidate previous completion'
+  end
+
+  def test_mark_completed_after_new_start_reports_completed
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    b.mark_started
+    b.mark_completed
+    sleep 0.01
+    b.mark_started
+    b.mark_completed
+    assert b.completed?
+  end
+
+  def test_completion_marker_survives_reload
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    b.mark_started
+    b.mark_completed
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    assert b2.completed?
+  end
+
+  def test_wip_marker_survives_reload
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    b.mark_started
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    assert_false b2.completed?
+  end
+
+  def test_entries_persist_alongside_bookmark
+    # entries + bookmark must roundtrip together
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    b.mark_started
+    b.persist_one('A', 'hash1')
+    b.mark_completed
+    b2 = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    assert b2.completed?
+    assert_false b2.changed?('A', 'hash1')
+  end
+
+  def test_legacy_flat_yaml_is_read_as_entries_without_bookmark
+    # Baseline files from earlier versions are a flat { name => sha } Hash.
+    # Loading must accept that format and report completed? == false (no marker).
+    require 'yaml'
+    File.write(@path, { 'LegacyA' => 'legacyhash' }.to_yaml)
+    b = RubyRdocCollector::SourceHashBaseline.new(path: @path)
+    assert_false b.changed?('LegacyA', 'legacyhash')
+    assert_false b.completed?
   end
 end
