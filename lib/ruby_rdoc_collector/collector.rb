@@ -2,18 +2,13 @@ require 'fileutils'
 
 module RubyRdocCollector
   class Collector
-    SOURCE_PREFIX    = 'ruby/ruby:rdoc/trunk'
-    THREAD_POOL_SIZE = 4   # method-level concurrency within a class
-    CLASS_POOL_SIZE  = 4   # class-level concurrency; total claude calls are globally
-                           # capped by Translator's semaphore, so this can safely be
-                           # >= THREAD_POOL_SIZE without exceeding claude budget.
+    SOURCE_PREFIX = 'ruby/ruby:rdoc/trunk'
 
     attr_reader :output_dir
 
     def initialize(config,
                    fetcher:     nil,
                    parser:      nil,
-                   translator:  nil,
                    formatter:   nil,
                    baseline:    nil,
                    output_dir:  nil,
@@ -23,7 +18,6 @@ module RubyRdocCollector
         url: @config['url'] || TarballFetcher::DEFAULT_URL
       )
       @parser      = parser     || HtmlParser.new
-      @translator  = translator || Translator.new
       @formatter   = formatter  || MarkdownFormatter.new
       @baseline    = baseline   || SourceHashBaseline.new
       @output_dir  = output_dir || default_output_dir
@@ -35,10 +29,6 @@ module RubyRdocCollector
 
       content_dir = @fetcher.fetch
 
-      # Fast path: tarball unchanged AND the last run completed cleanly → no-op.
-      # `completed?` distinguishes a finished full run from a partial/interrupted
-      # one; the latter leaves last_started_at > last_completed_at and must be
-      # resumed, not skipped. Smoke filters always bypass the fast path.
       return if @fetcher.unchanged? && @baseline.completed? && !smoke_filter_active?
 
       smoke = smoke_filter_active?
@@ -48,7 +38,7 @@ module RubyRdocCollector
       entities = @parser.parse(content_dir, targets: targets)
       entities = apply_max_methods_filter(entities)
 
-      process_entities_in_pool(entities, &block)
+      entities.each { |entity| process_entity(entity, &block) }
 
       unless smoke
         @baseline.cleanup_orphans unless entities.empty?
@@ -70,39 +60,13 @@ module RubyRdocCollector
       max_methods && max_methods > 0
     end
 
-    # Spawn CLASS_POOL_SIZE worker threads that pull entities from a shared
-    # queue. Each worker does the full per-entity pipeline; the final yield
-    # is serialized via @yield_mutex so the caller's block (typically
-    # store.store) observes a single-writer DB contract.
-    def process_entities_in_pool(entities, &block)
-      return if entities.empty?
-
-      yield_mutex = Mutex.new
-      queue       = Queue.new
-      entities.each { |e| queue << e }
-
-      workers = [CLASS_POOL_SIZE, entities.size].min.times.map do
-        Thread.new do
-          until queue.empty?
-            begin
-              entity = queue.pop(true)
-            rescue ThreadError
-              break
-            end
-            process_entity(entity, yield_mutex, &block)
-          end
-        end
-      end
-      workers.each(&:join)
-    end
-
-    def process_entity(entity, yield_mutex, &block)
+    def process_entity(entity, &block)
       @baseline.mark_seen(entity.name)
       new_hash = @baseline.hash_for(entity)
       return unless @baseline.changed?(entity.name, new_hash)
 
-      record = safe_translate_and_format(entity)
-      return unless record
+      content  = @formatter.format(entity)
+      record   = { content: content, source: "#{SOURCE_PREFIX}/#{entity.name}" }
 
       filename = sanitize_filename(entity.name) + '.md'
       begin
@@ -113,7 +77,7 @@ module RubyRdocCollector
       end
 
       begin
-        yield_mutex.synchronize { block.call(record) }
+        block.call(record)
       rescue => e
         warn "[RubyRdocCollector::Collector] yield failed for #{entity.name}: #{e.message}"
         return
@@ -135,61 +99,10 @@ module RubyRdocCollector
       File.write(File.join(dir, filename), content)
     end
 
-    # RUBY_RDOC_MAX_METHODS=N caps methods/class to first N after parse.
-    # (TARGETS filtering is applied earlier at parse-time via @parser.parse(..., targets:))
     def apply_max_methods_filter(entities)
       max_methods = ENV['RUBY_RDOC_MAX_METHODS']&.to_i
       return entities unless max_methods && max_methods > 0
       entities.map { |e| e.with(methods: e.methods.first(max_methods)) }
-    end
-
-    def safe_translate_and_format(entity)
-      jp_desc    = @translator.translate(entity.description)
-      en_desc    = entity.description
-
-      jp_methods = parallel_translate(entity.methods, threads: THREAD_POOL_SIZE) do |m|
-        begin
-          [m.name, @translator.translate(m.description)]
-        rescue Translator::TranslationError => e
-          warn "[RubyRdocCollector::Collector] skip method #{entity.name}##{m.name}: #{e.message}"
-          [m.name, '']
-        end
-      end.to_h
-
-      en_methods = entity.methods.to_h { |m| [m.name, m.description || ''] }
-
-      content = @formatter.format(entity,
-        jp_description:         jp_desc,
-        jp_method_descriptions: jp_methods,
-        en_description:         en_desc,
-        en_method_descriptions: en_methods)
-      { content: content, source: "#{SOURCE_PREFIX}/#{entity.name}" }
-    rescue Translator::TranslationError => e
-      warn "[RubyRdocCollector::Collector] skip #{entity.name}: #{e.message}"
-      nil
-    end
-
-    def parallel_translate(items, threads:, &block)
-      return [] if items.empty?
-
-      results  = Array.new(items.size)
-      queue    = Queue.new
-      items.each_with_index { |item, i| queue << [i, item] }
-
-      workers = [threads, items.size].min.times.map do
-        Thread.new do
-          until queue.empty?
-            begin
-              idx, item = queue.pop(true)
-            rescue ThreadError
-              break
-            end
-            results[idx] = block.call(item)
-          end
-        end
-      end
-      workers.each(&:join)
-      results
     end
   end
 end
