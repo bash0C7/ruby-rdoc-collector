@@ -46,15 +46,21 @@ For each parsed class, in order:
 7. Yield `{content:, source:}` to the caller — caller exception logs a warning and skips step 8
 8. `baseline.persist_one` atomically (Tempfile + rename)
 
-After iteration, `baseline.cleanup_orphans` removes per-class entries absent from this run. Cleanup is **skipped when a smoke filter is active** so smoke runs can't wipe the baseline.
+After iteration, `baseline.cleanup_orphans` removes per-class entries absent from this run and `baseline.mark_completed` records the completion marker. Both are **skipped when a smoke filter is active** so smoke runs can't wipe the baseline or advance the completion bookmark.
+
+## Concurrency
+
+`Translator` wraps every claude CLI invocation in a `ClaudeSemaphore` (default 4 slots) so the maximum number of concurrent claude subprocesses is bounded regardless of how many threads call `translate`. `Collector` runs `CLASS_POOL_SIZE` (default 4) class workers in parallel — each worker pulls an entity from a shared queue and runs the full per-entity pipeline. The yield to the caller's block is serialized by a `Mutex` so `store.store` observes a single-writer contract (SQLite WAL friendly). `SourceHashBaseline` guards its internal map with a mutex and writes atomic snapshots so baseline I/O never happens under the lock.
 
 ## Fast path
 
 When all of the following hold, `collect` returns immediately with no parse, translate, or file I/O:
 
 - `fetcher.unchanged?` — tarball SHA256 matches the last extracted tarball
-- `baseline.populated?` — the source-hash baseline has at least one entry
+- `baseline.completed?` — the most recent run was marked completed (two-phase bookmark)
 - no smoke filter active
+
+The baseline records `last_started_at` at the top of every non-smoke `collect` and `last_completed_at` only after `cleanup_orphans` succeeds. An interrupted run leaves `last_started_at > last_completed_at`, so `completed?` returns false and the next invocation resumes the full pipeline instead of fast-pathing.
 
 ## Smoke / integration escape hatches
 
@@ -74,7 +80,7 @@ When either is set, `cleanup_orphans` is skipped and the fast path is bypassed s
 | `~/.cache/ruby-rdoc-collector/tarball/tarball.sha256` | SHA256 of the tarball behind the current extracted tree; re-extract is skipped when it still matches |
 | `~/.cache/ruby-rdoc-collector/tarball/*.etag` | `curl --etag-compare` state for HTTP 304 short-circuit |
 | `~/.cache/ruby-rdoc-collector/translations/<shard>/<key>` | haiku JP output keyed by SHA256; prompt-unchanged retranslation is a cache hit |
-| `~/.cache/ruby-rdoc-collector/source_hashes.yml` | per-class English-source fingerprint; identical content skips the full pipeline |
+| `~/.cache/ruby-rdoc-collector/source_hashes.yml` | per-class English-source fingerprint + two-phase bookmark (`last_started_at` / `last_completed_at`); identical content skips the full pipeline, partial runs are resumed |
 
 Intermediate MD files (debug artifacts, not auto-cleaned):
 
